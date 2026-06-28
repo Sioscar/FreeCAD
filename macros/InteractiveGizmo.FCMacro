@@ -23,7 +23,24 @@ except ImportError as exc:
 
 COMMAND_TOGGLE = "InteractiveGizmo_Toggle"
 COMMAND_DETACH = "InteractiveGizmo_Detach"
-MACRO_VERSION = "1.0.1"
+MACRO_VERSION = "1.0.3"
+
+
+def _coin_node(type_name: str, fallback_type_name: str | None = None):
+    node_type = coin.SoType.fromName(type_name)
+    if node_type is not None and not node_type.isBad():
+        return node_type.createInstance()
+    if fallback_type_name:
+        return getattr(coin, fallback_type_name)()
+    raise RuntimeError(f"Coin node '{type_name}' is not available")
+
+
+def _create_transform_dragger():
+    """Instantiate FreeCAD's transform dragger (not exported as coin.SoTransformDragger)."""
+    try:
+        return _coin_node("SoTransformDragger")
+    except RuntimeError:
+        return coin.SoTransformerManip()
 
 
 def _placement_from_sb_rotation(sb_rot) -> App.Rotation:
@@ -113,7 +130,14 @@ def _selected_transformable() -> App.DocumentObject | None:
 
 
 def _notify_user(title: str, text: str, error: bool = False) -> None:
-    App.Console.PrintWarning(f"Interactive Gizmo: {text}\n")
+    if error:
+        App.Console.PrintError(f"Interactive Gizmo: {text}\n")
+    else:
+        App.Console.PrintMessage(f"Interactive Gizmo: {text}\n")
+
+    if not error:
+        return
+
     try:
         from PySide import QtGui
     except ImportError:
@@ -122,10 +146,7 @@ def _notify_user(title: str, text: str, error: bool = False) -> None:
         except ImportError:
             from PySide6 import QtWidgets as QtGui
 
-    if error:
-        QtGui.QMessageBox.warning(None, title, text)
-    else:
-        QtGui.QMessageBox.information(None, title, text)
+    QtGui.QMessageBox.warning(None, title, text)
 
 
 class GizmoManager:
@@ -203,8 +224,16 @@ class GizmoManager:
             return
 
         try:
-            dragger = coin.SoTransformDragger()
-        except AttributeError:
+            dragger = _create_transform_dragger()
+        except Exception as exc:
+            _notify_user(
+                "Interactive Gizmo",
+                f"无法创建手柄节点：\n{exc}",
+                error=True,
+            )
+            return
+
+        if dragger is None:
             _notify_user(
                 "Interactive Gizmo",
                 "SoTransformDragger 不可用。\n请确认在 FreeCAD GUI 中运行（不是命令行模式）。",
@@ -214,10 +243,11 @@ class GizmoManager:
 
         try:
             dragger.ref()
-            dragger.draggerSize.setValue(0.12)
+            if hasattr(dragger, "draggerSize"):
+                dragger.draggerSize.setValue(0.12)
 
             camera = view.getCameraNode()
-            if camera is not None:
+            if camera is not None and hasattr(dragger, "setUpAutoScale"):
                 dragger.setUpAutoScale(camera)
 
             self.obj = obj
@@ -277,14 +307,14 @@ class GizmoManager:
         pick_style = coin.SoPickStyle()
         pick_style.style = coin.SoPickStyle.SHAPE_ON_TOP
 
-        switch = coin.SoToggleSwitch()
+        switch = coin.SoSwitch()
         switch.whichChild = 0
 
         geometry = coin.SoSeparator()
         geometry.addChild(self.dragger)
         switch.addChild(geometry)
 
-        self.annotation = coin.So3DAnnotation()
+        self.annotation = _coin_node("So3DAnnotation", "SoSeparator")
         self.annotation.addChild(pick_style)
         self.annotation.addChild(switch)
 
@@ -322,15 +352,24 @@ class GizmoManager:
         dragger_placement = _object_global_placement(self.obj) * self.transform_origin
         self._set_dragger_placement(dragger_placement)
         self.anchor_placement = dragger_placement
-        self.dragger.clearIncrementCounts()
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
 
     def _set_dragger_placement(self, placement: App.Placement) -> None:
         base = placement.Base
         self.dragger.translation.setValue(coin.SbVec3f(base.x, base.y, base.z))
         self.dragger.rotation.setValue(_sb_rotation_from_placement(placement.Rotation))
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
 
     def _get_dragger_placement(self) -> App.Placement:
         d = self.dragger
+
+        if not hasattr(d, "translationIncrementCountX"):
+            trans = d.translation.getValue().getValue()
+            rot = _placement_from_sb_rotation(d.rotation.getValue())
+            return App.Placement(App.Vector(*trans), rot)
+
         base_pos = App.Vector(*d.translation.getValue().getValue())
         base_rot = _placement_from_sb_rotation(d.rotation.getValue())
 
@@ -389,7 +428,8 @@ class GizmoManager:
         self._dragging = True
         self._open_transaction()
         self.anchor_placement = self._get_dragger_placement()
-        self.dragger.clearIncrementCounts()
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
 
     def _on_drag_motion(self, _dragger) -> None:
         if not self._dragging:
@@ -402,7 +442,8 @@ class GizmoManager:
         self._dragging = False
         self._apply_dragger_to_object()
         self.anchor_placement = self._get_dragger_placement()
-        self.dragger.clearIncrementCounts()
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
         self._commit_transaction()
 
 
@@ -412,11 +453,8 @@ class _CommandToggle:
     def GetResources(self) -> dict:
         return {
             "Pixmap": "Std_TransformManip",
-            "MenuText": App.Translate("Cmd", "Interactive Gizmo"),
-            "ToolTip": App.Translate(
-                "Cmd",
-                "Show Shapr3D-like translate and rotate handles on the selected object",
-            ),
+            "MenuText": "Interactive Gizmo",
+            "ToolTip": "Show Shapr3D-like translate and rotate handles on the selected object",
         }
 
     def Activated(self) -> None:
@@ -432,8 +470,8 @@ class _CommandDetach:
     def GetResources(self) -> dict:
         return {
             "Pixmap": "Std_TransformManip",
-            "MenuText": App.Translate("Cmd", "Remove Interactive Gizmo"),
-            "ToolTip": App.Translate("Cmd", "Remove the interactive gizmo overlay"),
+            "MenuText": "Remove Interactive Gizmo",
+            "ToolTip": "Remove the interactive gizmo overlay",
         }
 
     def Activated(self) -> None:
