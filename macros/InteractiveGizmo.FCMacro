@@ -23,7 +23,7 @@ except ImportError as exc:
 
 COMMAND_TOGGLE = "InteractiveGizmo_Toggle"
 COMMAND_DETACH = "InteractiveGizmo_Detach"
-MACRO_VERSION = "1.0.0"
+MACRO_VERSION = "1.0.1"
 
 
 def _placement_from_sb_rotation(sb_rot) -> App.Rotation:
@@ -49,21 +49,83 @@ def _bbox_center_local(obj: App.DocumentObject) -> App.Vector:
     return App.Vector(0, 0, 0)
 
 
-def _selected_transformable() -> App.DocumentObject | None:
-    if App.GuiUp is False:
-        return None
-    selection = Gui.Selection.getSelectionEx("", 0)
-    if len(selection) != 1:
-        return None
-    obj = selection[0].Object
-    if obj is None or obj.isDerivedFrom("App::GeoFeature") is False:
-        return None
+def _object_global_placement(obj: App.DocumentObject) -> App.Placement:
+    if hasattr(obj, "getGlobalPlacement"):
+        return obj.getGlobalPlacement()
+    return obj.Placement
+
+
+def _set_object_global_placement(obj: App.DocumentObject, global_placement: App.Placement) -> None:
+    """Write a world-space placement back to the object's local Placement."""
+    parent_global = App.Placement()
+    if obj.InList:
+        for parent in obj.InList:
+            if hasattr(parent, "getGlobalPlacement"):
+                parent_global = parent.getGlobalPlacement()
+                break
+    obj.Placement = parent_global.inverse() * global_placement
+
+
+def _placement_is_editable(obj: App.DocumentObject) -> bool:
     placement_prop = obj.getPropertyByName("Placement")
-    if placement_prop is None or placement_prop.isReadOnly():
+    if placement_prop is None:
+        return False
+    if placement_prop.isReadOnly():
+        return False
+    editor_mode = obj.getEditorMode("Placement")
+    if editor_mode and "ReadOnly" in editor_mode:
+        return False
+    return True
+
+
+def _resolve_transformable(obj: App.DocumentObject) -> App.DocumentObject | None:
+    """Pick the object we should actually move (may differ from tree selection)."""
+    if obj is None or obj.isDerivedFrom("App::GeoFeature") is False:
         return None
     if hasattr(obj, "isFreezed") and obj.isFreezed():
         return None
-    return obj
+
+    if _placement_is_editable(obj):
+        return obj
+
+    # PartDesign Pad/Pocket 等特征的 Placement 常为只读，改选父级 Body。
+    for parent in obj.InList:
+        if parent.isDerivedFrom("PartDesign::Body") and _placement_is_editable(parent):
+            return parent
+        if parent.isDerivedFrom("App::Part") and _placement_is_editable(parent):
+            return parent
+
+    return None
+
+
+def _selected_transformable() -> App.DocumentObject | None:
+    if App.GuiUp is False:
+        return None
+
+    selection = Gui.Selection.getSelection()
+    if len(selection) != 1:
+        selection_ex = Gui.Selection.getSelectionEx()
+        if len(selection_ex) != 1:
+            return None
+        selection = [selection_ex[0].Object]
+
+    return _resolve_transformable(selection[0])
+
+
+def _notify_user(title: str, text: str, error: bool = False) -> None:
+    App.Console.PrintWarning(f"Interactive Gizmo: {text}\n")
+    try:
+        from PySide import QtGui
+    except ImportError:
+        try:
+            from PySide2 import QtWidgets as QtGui
+        except ImportError:
+            from PySide6 import QtWidgets as QtGui
+
+    if error:
+        QtGui.QMessageBox.warning(None, title, text)
+    else:
+        QtGui.QMessageBox.information(None, title, text)
 
 
 class GizmoManager:
@@ -96,10 +158,32 @@ class GizmoManager:
         return self.dragger is not None and self.obj is not None
 
     def toggle(self) -> None:
+        selected = Gui.Selection.getSelection()
+        if len(selected) != 1:
+            _notify_user(
+                "Interactive Gizmo",
+                "请先在模型树里只选中 1 个对象（建议选 Body，不要选 Pad）。",
+                error=True,
+            )
+            return
+
         obj = _selected_transformable()
         if obj is None:
-            App.Console.PrintWarning("Interactive Gizmo: select exactly one object with Placement.\n")
+            _notify_user(
+                "Interactive Gizmo",
+                "当前对象不能移动：\n"
+                "• Part Design 里请选中 Body（Pad 的 Placement 通常是只读）\n"
+                "• 或换 Part 工作台里的立方体测试",
+                error=True,
+            )
             return
+
+        if selected[0] != obj:
+            App.Console.PrintMessage(
+                f"Interactive Gizmo: '{selected[0].Label}' 不可直接移动，"
+                f"已改用 '{obj.Label}'。\n"
+            )
+
         if self.is_active and self.obj is obj:
             self.detach()
             return
@@ -110,42 +194,58 @@ class GizmoManager:
 
         gdoc = Gui.ActiveDocument
         if gdoc is None:
-            App.Console.PrintError("Interactive Gizmo: no active GUI document.\n")
+            _notify_user("Interactive Gizmo", "没有活动的 GUI 文档。", error=True)
             return
 
         view = gdoc.ActiveView
         if view is None:
-            App.Console.PrintError("Interactive Gizmo: no active 3D view.\n")
+            _notify_user("Interactive Gizmo", "没有活动的 3D 视图。", error=True)
             return
 
         try:
             dragger = coin.SoTransformDragger()
         except AttributeError:
-            App.Console.PrintError(
-                "Interactive Gizmo: SoTransformDragger is unavailable. "
-                "Run inside FreeCAD GUI after Gui module load.\n"
+            _notify_user(
+                "Interactive Gizmo",
+                "SoTransformDragger 不可用。\n请确认在 FreeCAD GUI 中运行（不是命令行模式）。",
+                error=True,
             )
             return
 
-        dragger.ref()
-        dragger.draggerSize.setValue(0.08)
+        try:
+            dragger.ref()
+            dragger.draggerSize.setValue(0.12)
 
-        camera = view.getCameraNode()
-        if camera is not None:
-            dragger.setUpAutoScale(camera)
+            camera = view.getCameraNode()
+            if camera is not None:
+                dragger.setUpAutoScale(camera)
 
-        self.obj = obj
-        self.doc = obj.Document
-        self.view = view
-        self.dragger = dragger
-        self.transform_origin = App.Placement(_bbox_center_local(obj), App.Rotation())
-        self._build_scene_overlay()
-        self._sync_dragger_from_object()
-        self._register_callbacks()
+            self.obj = obj
+            self.doc = obj.Document
+            self.view = view
+            self.dragger = dragger
+            self.transform_origin = App.Placement(_bbox_center_local(obj), App.Rotation())
+            self._build_scene_overlay()
+            self._sync_dragger_from_object()
+            self._register_callbacks()
+        except Exception as exc:
+            self.detach()
+            _notify_user(
+                "Interactive Gizmo",
+                f"挂手柄失败：\n{exc}",
+                error=True,
+            )
+            App.Console.PrintError(f"Interactive Gizmo attach failed: {exc}\n")
+            return
 
         App.Console.PrintMessage(
             f"Interactive Gizmo: attached to '{obj.Label}' "
             f"(pivot = bounding-box center, v{MACRO_VERSION}).\n"
+        )
+        _notify_user(
+            "Interactive Gizmo",
+            f"手柄已挂在「{obj.Label}」上。\n"
+            "拖箭头平移、拖圆环旋转；再执行一次宏可关闭。",
         )
 
     def detach(self) -> None:
@@ -178,7 +278,7 @@ class GizmoManager:
         pick_style.style = coin.SoPickStyle.SHAPE_ON_TOP
 
         switch = coin.SoToggleSwitch()
-        switch.whichChild = coin.SoSwitch.SO_SWITCH_ALL
+        switch.whichChild = 0
 
         geometry = coin.SoSeparator()
         geometry.addChild(self.dragger)
@@ -219,7 +319,7 @@ class GizmoManager:
     def _sync_dragger_from_object(self) -> None:
         if self.obj is None or self.dragger is None:
             return
-        dragger_placement = self.obj.Placement * self.transform_origin
+        dragger_placement = _object_global_placement(self.obj) * self.transform_origin
         self._set_dragger_placement(dragger_placement)
         self.anchor_placement = dragger_placement
         self.dragger.clearIncrementCounts()
@@ -264,7 +364,8 @@ class GizmoManager:
         if self.obj is None:
             return
         new_dragger_placement = self._get_dragger_placement()
-        self.obj.Placement = new_dragger_placement * self.transform_origin.inverse()
+        new_global = new_dragger_placement * self.transform_origin.inverse()
+        _set_object_global_placement(self.obj, new_global)
 
     def _open_transaction(self) -> None:
         if self._transaction_open or self.doc is None:
