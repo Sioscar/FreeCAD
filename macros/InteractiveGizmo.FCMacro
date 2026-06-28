@@ -23,7 +23,8 @@ except ImportError as exc:
 
 COMMAND_TOGGLE = "InteractiveGizmo_Toggle"
 COMMAND_DETACH = "InteractiveGizmo_Detach"
-MACRO_VERSION = "1.0.3"
+COMMAND_AUTO = "InteractiveGizmo_AutoToggle"
+MACRO_VERSION = "1.1.0"
 
 
 def _coin_node(type_name: str, fallback_type_name: str | None = None):
@@ -84,14 +85,20 @@ def _set_object_global_placement(obj: App.DocumentObject, global_placement: App.
 
 
 def _placement_is_editable(obj: App.DocumentObject) -> bool:
-    placement_prop = obj.getPropertyByName("Placement")
-    if placement_prop is None:
+    if not hasattr(obj, "Placement"):
         return False
-    if placement_prop.isReadOnly():
-        return False
+
     editor_mode = obj.getEditorMode("Placement")
     if editor_mode and "ReadOnly" in editor_mode:
         return False
+
+    placement_prop = obj.getPropertyByName("Placement")
+    if placement_prop is None:
+        return False
+    if hasattr(placement_prop, "isReadOnly"):
+        return not placement_prop.isReadOnly()
+
+    # Some FreeCAD builds return a Placement value instead of the property object.
     return True
 
 
@@ -149,6 +156,22 @@ def _notify_user(title: str, text: str, error: bool = False) -> None:
     QtGui.QMessageBox.warning(None, title, text)
 
 
+class GizmoSelectionObserver:
+    """v1.1: show/hide gizmo when the user changes selection."""
+
+    def addSelection(self, doc, obj, sub, pnt):
+        GizmoManager.instance().sync_auto_from_selection()
+
+    def removeSelection(self, doc, obj, sub):
+        GizmoManager.instance().sync_auto_from_selection()
+
+    def setSelection(self, doc):
+        GizmoManager.instance().sync_auto_from_selection()
+
+    def clearSelection(self, doc):
+        GizmoManager.instance().sync_auto_from_selection()
+
+
 class GizmoManager:
     """Singleton that owns the overlay dragger and writes Placement on drag."""
 
@@ -167,6 +190,8 @@ class GizmoManager:
         self._cb_start = None
         self._cb_motion = None
         self._cb_finish = None
+        self.auto_mode = False
+        self._selection_observer = None
 
     @classmethod
     def instance(cls) -> GizmoManager:
@@ -210,35 +235,84 @@ class GizmoManager:
             return
         self.attach(obj)
 
-    def attach(self, obj: App.DocumentObject) -> None:
+    def toggle_auto_mode(self) -> None:
+        if self.auto_mode:
+            self.disable_auto_mode()
+        else:
+            self.enable_auto_mode()
+
+    def enable_auto_mode(self) -> None:
+        if self.auto_mode:
+            return
+        self.auto_mode = True
+        if self._selection_observer is None:
+            self._selection_observer = GizmoSelectionObserver()
+        Gui.Selection.addObserver(self._selection_observer)
+        App.Console.PrintMessage(
+            f"Interactive Gizmo: auto mode ON (v{MACRO_VERSION}).\n"
+        )
+        self.sync_auto_from_selection()
+
+    def disable_auto_mode(self) -> None:
+        if not self.auto_mode:
+            return
+        self.auto_mode = False
+        if self._selection_observer is not None:
+            Gui.Selection.removeObserver(self._selection_observer)
+        App.Console.PrintMessage("Interactive Gizmo: auto mode OFF.\n")
+
+    def sync_auto_from_selection(self) -> None:
+        if not self.auto_mode or self._dragging:
+            return
+
+        selection = Gui.Selection.getSelection()
+        if len(selection) != 1:
+            self.detach()
+            return
+
+        obj = _resolve_transformable(selection[0])
+        if obj is None:
+            self.detach()
+            return
+
+        if self.is_active and self.obj is obj:
+            return
+
+        self.attach(obj, silent=True)
+
+    def attach(self, obj: App.DocumentObject, silent: bool = False) -> None:
         self.detach()
 
         gdoc = Gui.ActiveDocument
         if gdoc is None:
-            _notify_user("Interactive Gizmo", "没有活动的 GUI 文档。", error=True)
+            if not silent:
+                _notify_user("Interactive Gizmo", "没有活动的 GUI 文档。", error=True)
             return
 
         view = gdoc.ActiveView
         if view is None:
-            _notify_user("Interactive Gizmo", "没有活动的 3D 视图。", error=True)
+            if not silent:
+                _notify_user("Interactive Gizmo", "没有活动的 3D 视图。", error=True)
             return
 
         try:
             dragger = _create_transform_dragger()
         except Exception as exc:
-            _notify_user(
-                "Interactive Gizmo",
-                f"无法创建手柄节点：\n{exc}",
-                error=True,
-            )
+            if not silent:
+                _notify_user(
+                    "Interactive Gizmo",
+                    f"无法创建手柄节点：\n{exc}",
+                    error=True,
+                )
             return
 
         if dragger is None:
-            _notify_user(
-                "Interactive Gizmo",
-                "SoTransformDragger 不可用。\n请确认在 FreeCAD GUI 中运行（不是命令行模式）。",
-                error=True,
-            )
+            if not silent:
+                _notify_user(
+                    "Interactive Gizmo",
+                    "SoTransformDragger 不可用。\n请确认在 FreeCAD GUI 中运行（不是命令行模式）。",
+                    error=True,
+                )
             return
 
         try:
@@ -260,11 +334,12 @@ class GizmoManager:
             self._register_callbacks()
         except Exception as exc:
             self.detach()
-            _notify_user(
-                "Interactive Gizmo",
-                f"挂手柄失败：\n{exc}",
-                error=True,
-            )
+            if not silent:
+                _notify_user(
+                    "Interactive Gizmo",
+                    f"挂手柄失败：\n{exc}",
+                    error=True,
+                )
             App.Console.PrintError(f"Interactive Gizmo attach failed: {exc}\n")
             return
 
@@ -272,11 +347,12 @@ class GizmoManager:
             f"Interactive Gizmo: attached to '{obj.Label}' "
             f"(pivot = bounding-box center, v{MACRO_VERSION}).\n"
         )
-        _notify_user(
-            "Interactive Gizmo",
-            f"手柄已挂在「{obj.Label}」上。\n"
-            "拖箭头平移、拖圆环旋转；再执行一次宏可关闭。",
-        )
+        if not silent:
+            _notify_user(
+                "Interactive Gizmo",
+                f"手柄已挂在「{obj.Label}」上。\n"
+                "拖箭头平移、拖圆环旋转；再执行一次宏可关闭。",
+            )
 
     def detach(self) -> None:
         if not self.is_active and self.annotation is None:
@@ -464,6 +540,23 @@ class _CommandToggle:
         return _selected_transformable() is not None or GizmoManager.instance().is_active
 
 
+class _CommandAutoToggle:
+    """Enable / disable attach-on-select behavior (v1.1)."""
+
+    def GetResources(self) -> dict:
+        return {
+            "Pixmap": "Std_TransformManip",
+            "MenuText": "Interactive Gizmo Auto",
+            "ToolTip": "Toggle automatic gizmo on single selection (Shapr3D-like)",
+        }
+
+    def Activated(self) -> None:
+        GizmoManager.instance().toggle_auto_mode()
+
+    def IsActive(self) -> bool:
+        return App.GuiUp
+
+
 class _CommandDetach:
     """Remove the interactive gizmo overlay."""
 
@@ -484,6 +577,8 @@ class _CommandDetach:
 def _register_commands() -> None:
     if COMMAND_TOGGLE not in Gui.listCommands():
         Gui.addCommand(COMMAND_TOGGLE, _CommandToggle())
+    if COMMAND_AUTO not in Gui.listCommands():
+        Gui.addCommand(COMMAND_AUTO, _CommandAutoToggle())
     if COMMAND_DETACH not in Gui.listCommands():
         Gui.addCommand(COMMAND_DETACH, _CommandDetach())
 

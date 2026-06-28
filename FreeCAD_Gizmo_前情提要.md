@@ -4,6 +4,20 @@
 
 ---
 
+## Agent 协作规则（持久 — 压缩上下文时不得遗忘）
+
+**用户授权（2026-06-28）：**
+
+> 如果可以推进就请自行推进；如果判断必须由用户介入了就停下来。
+
+**Agent 执行准则：**
+
+1. **默认自主推进**：修 bug、补测试、更新文档、实现路线图中已拍板的下一小版本（如 v1.1），无需等用户在线。
+2. **必须停下来等用户**：需要本机 FreeCAD 实机验收、重大产品设计拍板（v2 吸附策略等）、账号密钥、或无法在无头/Linux 环境验证的 Windows 专属问题。
+3. **每次自主推进后**：更新本文档「§7 实现状态」、commit + push、必要时更新 PR，写清用户醒来后要做什么（若有）。
+
+---
+
 ## 0. 一句话目标
 
 > **选中一个实体 / 草图 / 对象后，自动（或按键）在它身上显示可用鼠标拖动的「平移箭头 + 旋转环」手柄；拖动后把变换实时写回该对象的 `Placement`。**
@@ -150,22 +164,55 @@ manip.addValueChangedCallback(on_motion)   # 具体回调注册方式按 pivy �
 
 | 文件 | 说明 |
 |------|------|
-| `macros/InteractiveGizmo.FCMacro` | **v1 宏**：命令触发，平移+旋转，写回 `Placement`，旋转中心=包围盒中心 |
-| `src/Gui/Inventor/Draggers/SoTransformDragger.*` | FreeCAD 内置三轴平移+旋转手柄（宏优先复用此节点） |
-| `src/Gui/ViewProviderDragger.*` | 内置 `Std_TransformManip` 的实现参考（含 pivot / undo 逻辑） |
+| `macros/InteractiveGizmo.FCMacro` | **v1.1 宏**：命令触发 + 可选「选中自动显示」 |
+| `tools/gizmo_gui_test.py` | 无头 GUI 回归测试（FreeCAD 1.1.1 AppImage + xvfb） |
+| `src/Gui/Inventor/Draggers/SoTransformDragger.*` | FreeCAD 内置手柄（宏通过 `SoType.fromName` 实例化） |
+| `src/Gui/ViewProviderDragger.*` | 内置 `Std_TransformManip` 参考实现 |
+
+### 当前版本：v1.1.0
+
+| 功能 | 状态 |
+|------|------|
+| 命令触发手柄 `InteractiveGizmo_Toggle` | ✅ |
+| 选中自动显示 `InteractiveGizmo_AutoToggle` | ✅ v1.1 |
+| 平移 + 旋转写回 `Placement` | ✅ |
+| Undo（每次拖拽一步） | ✅ |
+| 旋转中心 = 包围盒中心 | ✅ |
+| Part Design：选 Pad 自动改用 Body | ✅ |
+
+### FreeCAD 1.1.1 踩坑（已修，勿回退）
+
+| 问题 | 正确写法 |
+|------|----------|
+| `App.Translate` 不存在 | 命令 `GetResources` 用纯英文字符串 |
+| `coin.SoTransformDragger()` 不存在 | `coin.SoType.fromName("SoTransformDragger").createInstance()` |
+| `coin.So3DAnnotation()` 不存在 | `SoType.fromName("So3DAnnotation")` |
+| `coin.SoToggleSwitch()` 不存在 | 用 `coin.SoSwitch()` |
+| Pad 的 Placement 只读 | `_resolve_transformable()` 改挂父级 Body |
 
 ### 使用方法
 
-1. 在 FreeCAD 中：**宏 → 宏管理 → 添加** `macros/InteractiveGizmo.FCMacro`（或从文件执行一次以注册命令）。
-2. 选中一个带 `Placement` 的对象（Body、Pad、Part 等）。
-3. 运行命令 **「交互手柄」**（`InteractiveGizmo_Toggle`），或再次执行宏。
-4. 拖动手柄平移/旋转；松手后 **Ctrl+Z** 可撤销。
-5. 再运行一次命令可移除手柄。
+1. 下载宏：  
+   https://github.com/Sioscar/FreeCAD/raw/cursor/shapr3d-gizmo-macro-v1-ff25/macros/InteractiveGizmo.FCMacro
+2. **宏 → 宏管理**，用户宏目录指向含该文件的文件夹，**执行一次**（注册命令）。
+3. **Part 工作台** 放立方体，或 **Part Design** 选中 **Body**（不要只选 Pad）。
+4. 命令：
+   - `InteractiveGizmo_Toggle` — 手动显示/关闭手柄
+   - `InteractiveGizmo_AutoToggle` — 开/关「选中即显示」
+   - `InteractiveGizmo_Detach` — 强制移除手柄
+5. 拖箭头/圆环；**Ctrl+Z** 撤销。
+6. 看 **报告视图** 是否有 `attached to ... v1.1.0`。
+
+### 用户醒来后请验收（需本机）
+
+- [ ] Part 立方体：手柄可见、可拖、可 Undo
+- [ ] Part Design Body：同上
+- [ ] 自动模式：选中显示、换选切换、清空选择消失
+- [ ] 反馈手柄大小、手感、是否与 MayaGesture 冲突
 
 ---
 
-## 8. 下一步（新会话开场可直接说）
+## 8. 下一步
 
-> 「按 `FreeCAD_Gizmo_前情提要.md` 的 v1 验收标准，帮我写一个**命令触发**的宏：对当前选中的实体显示平移+旋转手柄，拖动后写回 `Placement`，支持 Undo。旋转中心用包围盒中心。先给我能在 FreeCAD Python 控制台/宏里直接跑的版本。」
-
-**v1 已完成（宏）。** 下一步可做 v1.1：选中自动显示 / 取消自动移除（SelectionObserver）。
+- **v1.2**：手柄尺寸随包围盒自适应（调 `draggerSize` / `setUpAutoScale`）
+- **v2**：吸附（复用 `Draft.Snapper`）
