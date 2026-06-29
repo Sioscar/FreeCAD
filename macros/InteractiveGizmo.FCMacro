@@ -1,0 +1,717 @@
+# -*- coding: utf-8 -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Interactive Gizmo (v1) — Shapr3D-like transform handles for FreeCAD
+#
+# Usage:
+#   1. Macro → Macros... → add this file, then Execute once (registers commands).
+#   2. Select one object with a Placement property.
+#   3. Run command "Interactive Gizmo" (InteractiveGizmo_Toggle).
+#
+# See FreeCAD_Gizmo_前情提要.md in the repo root for design notes and roadmap.
+
+from __future__ import annotations
+
+import FreeCAD as App
+import FreeCADGui as Gui
+
+try:
+    from pivy import coin
+except ImportError as exc:
+    raise ImportError("Interactive Gizmo requires pivy (bundled with FreeCAD).") from exc
+
+
+COMMAND_TOGGLE = "InteractiveGizmo_Toggle"
+COMMAND_DETACH = "InteractiveGizmo_Detach"
+COMMAND_AUTO = "InteractiveGizmo_AutoToggle"
+COMMAND_SETTINGS = "InteractiveGizmo_Settings"
+MACRO_VERSION = "1.2.0"
+PREF_GROUP = "User parameter:BaseApp/Preferences/Mod/InteractiveGizmo"
+SCALE_MODE_SCREEN = 0
+SCALE_MODE_WORLD = 1
+DEFAULT_DISPLAY_RATIO = 0.10
+
+
+def _coin_node(type_name: str, fallback_type_name: str | None = None):
+    node_type = coin.SoType.fromName(type_name)
+    if node_type is not None and not node_type.isBad():
+        return node_type.createInstance()
+    if fallback_type_name:
+        return getattr(coin, fallback_type_name)()
+    raise RuntimeError(f"Coin node '{type_name}' is not available")
+
+
+def _prefs() -> App.ParameterGroup:
+    return App.ParamGet(PREF_GROUP)
+
+
+def get_display_ratio() -> float:
+    return _prefs().GetFloat("DisplayRatio", DEFAULT_DISPLAY_RATIO)
+
+
+def set_display_ratio(value: float) -> None:
+    _prefs().SetFloat("DisplayRatio", max(0.01, min(value, 1.0)))
+
+
+def get_scale_mode() -> int:
+    return int(_prefs().GetInt("ScaleMode", SCALE_MODE_SCREEN))
+
+
+def set_scale_mode(mode: int) -> None:
+    _prefs().SetInt("ScaleMode", int(mode))
+
+
+def get_camera_node(view):
+    """Prefer viewer camera; fall back to deprecated ActiveView.getCameraNode()."""
+    try:
+        viewer = view.getViewer()
+        if viewer is not None:
+            render_manager = viewer.getSoRenderManager()
+            if render_manager is not None:
+                camera = render_manager.getCamera()
+                if camera is not None:
+                    return camera
+    except Exception:
+        pass
+
+    try:
+        return view.getCameraNode()
+    except Exception:
+        return None
+
+
+def _bbox_diagonal(obj: App.DocumentObject) -> float:
+    shape = getattr(obj, "Shape", None)
+    if shape is not None and not shape.isNull():
+        bb = shape.BoundBox
+        return bb.DiagonalLength
+    return 10.0
+
+
+def _apply_dragger_scale(dragger, view, obj: App.DocumentObject) -> None:
+    ratio = get_display_ratio()
+    if get_scale_mode() == SCALE_MODE_SCREEN:
+        if hasattr(dragger, "draggerSize"):
+            dragger.draggerSize.setValue(ratio)
+        camera = get_camera_node(view)
+        if camera is not None and hasattr(dragger, "setUpAutoScale"):
+            dragger.setUpAutoScale(camera)
+    else:
+        world_size = max(_bbox_diagonal(obj) * ratio, 1.0)
+        if hasattr(dragger, "draggerSize"):
+            dragger.draggerSize.setValue(world_size)
+
+
+def _create_transform_dragger():
+    """Instantiate FreeCAD's transform dragger (not exported as coin.SoTransformDragger)."""
+    try:
+        return _coin_node("SoTransformDragger")
+    except RuntimeError:
+        return coin.SoTransformerManip()
+
+
+def _placement_from_sb_rotation(sb_rot) -> App.Rotation:
+    q = sb_rot.getValue()
+    return App.Rotation(q[0], q[1], q[2], q[3])
+
+
+def _sb_rotation_from_placement(rotation: App.Rotation):
+    q = rotation.Q
+    return coin.SbRotation(q[0], q[1], q[2], q[3])
+
+
+def _bbox_center_local(obj: App.DocumentObject) -> App.Vector:
+    """Pivot in the object's local coordinates (bounding-box center)."""
+    shape = getattr(obj, "Shape", None)
+    if shape is not None and not shape.isNull():
+        bb = shape.BoundBox
+        return App.Vector(
+            (bb.XMin + bb.XMax) * 0.5,
+            (bb.YMin + bb.YMax) * 0.5,
+            (bb.ZMin + bb.ZMax) * 0.5,
+        )
+    return App.Vector(0, 0, 0)
+
+
+def _object_global_placement(obj: App.DocumentObject) -> App.Placement:
+    if hasattr(obj, "getGlobalPlacement"):
+        return obj.getGlobalPlacement()
+    return obj.Placement
+
+
+def _set_object_global_placement(obj: App.DocumentObject, global_placement: App.Placement) -> None:
+    """Write a world-space placement back to the object's local Placement."""
+    parent_global = App.Placement()
+    if obj.InList:
+        for parent in obj.InList:
+            if hasattr(parent, "getGlobalPlacement"):
+                parent_global = parent.getGlobalPlacement()
+                break
+    obj.Placement = parent_global.inverse() * global_placement
+
+
+def _placement_is_editable(obj: App.DocumentObject) -> bool:
+    if not hasattr(obj, "Placement"):
+        return False
+
+    editor_mode = obj.getEditorMode("Placement")
+    if editor_mode and "ReadOnly" in editor_mode:
+        return False
+
+    placement_prop = obj.getPropertyByName("Placement")
+    if placement_prop is None:
+        return False
+    if hasattr(placement_prop, "isReadOnly"):
+        return not placement_prop.isReadOnly()
+
+    # Some FreeCAD builds return a Placement value instead of the property object.
+    return True
+
+
+def _resolve_transformable(obj: App.DocumentObject) -> App.DocumentObject | None:
+    """Pick the object we should actually move (may differ from tree selection)."""
+    if obj is None or obj.isDerivedFrom("App::GeoFeature") is False:
+        return None
+    if hasattr(obj, "isFreezed") and obj.isFreezed():
+        return None
+
+    if _placement_is_editable(obj):
+        return obj
+
+    # PartDesign Pad/Pocket 等特征的 Placement 常为只读，改选父级 Body。
+    for parent in obj.InList:
+        if parent.isDerivedFrom("PartDesign::Body") and _placement_is_editable(parent):
+            return parent
+        if parent.isDerivedFrom("App::Part") and _placement_is_editable(parent):
+            return parent
+
+    return None
+
+
+def _selected_transformable() -> App.DocumentObject | None:
+    if App.GuiUp is False:
+        return None
+
+    selection = Gui.Selection.getSelection()
+    if len(selection) != 1:
+        selection_ex = Gui.Selection.getSelectionEx()
+        if len(selection_ex) != 1:
+            return None
+        selection = [selection_ex[0].Object]
+
+    return _resolve_transformable(selection[0])
+
+
+def _notify_user(title: str, text: str, error: bool = False) -> None:
+    if error:
+        App.Console.PrintError(f"Interactive Gizmo: {text}\n")
+    else:
+        App.Console.PrintMessage(f"Interactive Gizmo: {text}\n")
+
+    if not error:
+        return
+
+    try:
+        from PySide import QtGui
+    except ImportError:
+        try:
+            from PySide2 import QtWidgets as QtGui
+        except ImportError:
+            from PySide6 import QtWidgets as QtGui
+
+    QtGui.QMessageBox.warning(None, title, text)
+
+
+class GizmoSelectionObserver:
+    """v1.1: show/hide gizmo when the user changes selection."""
+
+    def addSelection(self, doc, obj, sub, pnt):
+        GizmoManager.instance().sync_auto_from_selection()
+
+    def removeSelection(self, doc, obj, sub):
+        GizmoManager.instance().sync_auto_from_selection()
+
+    def setSelection(self, doc):
+        GizmoManager.instance().sync_auto_from_selection()
+
+    def clearSelection(self, doc):
+        GizmoManager.instance().sync_auto_from_selection()
+
+
+class GizmoManager:
+    """Singleton that owns the overlay dragger and writes Placement on drag."""
+
+    _instance: GizmoManager | None = None
+
+    def __init__(self) -> None:
+        self.obj: App.DocumentObject | None = None
+        self.doc: App.Document | None = None
+        self.view = None
+        self.dragger = None
+        self.annotation = None
+        self.transform_origin = App.Placement()
+        self.anchor_placement = App.Placement()
+        self._dragging = False
+        self._transaction_open = False
+        self._cb_start = None
+        self._cb_motion = None
+        self._cb_finish = None
+        self.auto_mode = False
+        self._selection_observer = None
+
+    @classmethod
+    def instance(cls) -> GizmoManager:
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @property
+    def is_active(self) -> bool:
+        return self.dragger is not None and self.obj is not None
+
+    def toggle(self) -> None:
+        selected = Gui.Selection.getSelection()
+        if len(selected) != 1:
+            _notify_user(
+                "Interactive Gizmo",
+                "请先在模型树里只选中 1 个对象（建议选 Body，不要选 Pad）。",
+                error=True,
+            )
+            return
+
+        obj = _selected_transformable()
+        if obj is None:
+            _notify_user(
+                "Interactive Gizmo",
+                "当前对象不能移动：\n"
+                "• Part Design 里请选中 Body（Pad 的 Placement 通常是只读）\n"
+                "• 或换 Part 工作台里的立方体测试",
+                error=True,
+            )
+            return
+
+        if selected[0] != obj:
+            App.Console.PrintMessage(
+                f"Interactive Gizmo: '{selected[0].Label}' 不可直接移动，"
+                f"已改用 '{obj.Label}'。\n"
+            )
+
+        if self.is_active and self.obj is obj:
+            self.detach()
+            return
+        self.attach(obj)
+
+    def toggle_auto_mode(self) -> None:
+        if self.auto_mode:
+            self.disable_auto_mode()
+        else:
+            self.enable_auto_mode()
+
+    def enable_auto_mode(self) -> None:
+        if self.auto_mode:
+            return
+        self.auto_mode = True
+        if self._selection_observer is None:
+            self._selection_observer = GizmoSelectionObserver()
+        Gui.Selection.addObserver(self._selection_observer)
+        App.Console.PrintMessage(
+            f"Interactive Gizmo: auto mode ON (v{MACRO_VERSION}).\n"
+        )
+        self.sync_auto_from_selection()
+
+    def disable_auto_mode(self) -> None:
+        if not self.auto_mode:
+            return
+        self.auto_mode = False
+        if self._selection_observer is not None:
+            Gui.Selection.removeObserver(self._selection_observer)
+        App.Console.PrintMessage("Interactive Gizmo: auto mode OFF.\n")
+
+    def sync_auto_from_selection(self) -> None:
+        if not self.auto_mode or self._dragging:
+            return
+
+        selection = Gui.Selection.getSelection()
+        if len(selection) != 1:
+            self.detach()
+            return
+
+        obj = _resolve_transformable(selection[0])
+        if obj is None:
+            self.detach()
+            return
+
+        if self.is_active and self.obj is obj:
+            return
+
+        self.attach(obj, silent=True)
+
+    def attach(self, obj: App.DocumentObject, silent: bool = False) -> None:
+        self.detach()
+
+        gdoc = Gui.ActiveDocument
+        if gdoc is None:
+            if not silent:
+                _notify_user("Interactive Gizmo", "没有活动的 GUI 文档。", error=True)
+            return
+
+        view = gdoc.ActiveView
+        if view is None:
+            if not silent:
+                _notify_user("Interactive Gizmo", "没有活动的 3D 视图。", error=True)
+            return
+
+        try:
+            dragger = _create_transform_dragger()
+        except Exception as exc:
+            if not silent:
+                _notify_user(
+                    "Interactive Gizmo",
+                    f"无法创建手柄节点：\n{exc}",
+                    error=True,
+                )
+            return
+
+        if dragger is None:
+            if not silent:
+                _notify_user(
+                    "Interactive Gizmo",
+                    "SoTransformDragger 不可用。\n请确认在 FreeCAD GUI 中运行（不是命令行模式）。",
+                    error=True,
+                )
+            return
+
+        try:
+            dragger.ref()
+            _apply_dragger_scale(dragger, view, obj)
+
+            self.obj = obj
+            self.doc = obj.Document
+            self.view = view
+            self.dragger = dragger
+            self.transform_origin = App.Placement(_bbox_center_local(obj), App.Rotation())
+            self._build_scene_overlay()
+            self._sync_dragger_from_object()
+            self._register_callbacks()
+        except Exception as exc:
+            self.detach()
+            if not silent:
+                _notify_user(
+                    "Interactive Gizmo",
+                    f"挂手柄失败：\n{exc}",
+                    error=True,
+                )
+            App.Console.PrintError(f"Interactive Gizmo attach failed: {exc}\n")
+            return
+
+        App.Console.PrintMessage(
+            f"Interactive Gizmo: attached to '{obj.Label}' "
+            f"(pivot = bounding-box center, v{MACRO_VERSION}).\n"
+        )
+        if not silent:
+            _notify_user(
+                "Interactive Gizmo",
+                f"手柄已挂在「{obj.Label}」上。\n"
+                "拖箭头平移、拖圆环旋转；再执行一次宏可关闭。",
+            )
+
+    def detach(self) -> None:
+        if not self.is_active and self.annotation is None:
+            return
+
+        self._abort_transaction()
+        self._unregister_callbacks()
+
+        if self.view is not None and self.annotation is not None:
+            sg = self.view.getSceneGraph()
+            if sg.findChild(self.annotation) >= 0:
+                sg.removeChild(self.annotation)
+
+        if self.dragger is not None:
+            self.dragger.unref()
+            self.dragger = None
+
+        if self.is_active:
+            App.Console.PrintMessage(f"Interactive Gizmo: detached from '{self.obj.Label}'.\n")
+
+        self.annotation = None
+        self.obj = None
+        self.doc = None
+        self.view = None
+        self._dragging = False
+
+    def _build_scene_overlay(self) -> None:
+        pick_style = coin.SoPickStyle()
+        pick_style.style = coin.SoPickStyle.SHAPE_ON_TOP
+
+        switch = coin.SoSwitch()
+        switch.whichChild = 0
+
+        geometry = coin.SoSeparator()
+        geometry.addChild(self.dragger)
+        switch.addChild(geometry)
+
+        self.annotation = _coin_node("So3DAnnotation", "SoSeparator")
+        self.annotation.addChild(pick_style)
+        self.annotation.addChild(switch)
+
+        sg = self.view.getSceneGraph()
+        sg.insertChild(self.annotation, 0)
+
+    def _register_callbacks(self) -> None:
+        self._cb_start = self.view.addDraggerCallback(
+            self.dragger, "addStartCallback", self._on_drag_start
+        )
+        self._cb_motion = self.view.addDraggerCallback(
+            self.dragger, "addMotionCallback", self._on_drag_motion
+        )
+        self._cb_finish = self.view.addDraggerCallback(
+            self.dragger, "addFinishCallback", self._on_drag_finish
+        )
+
+    def _unregister_callbacks(self) -> None:
+        if self.view is None or self.dragger is None:
+            return
+        for cb_type, handle in (
+            ("addStartCallback", self._cb_start),
+            ("addMotionCallback", self._cb_motion),
+            ("addFinishCallback", self._cb_finish),
+        ):
+            if handle is not None:
+                self.view.removeDraggerCallback(self.dragger, cb_type, handle)
+        self._cb_start = None
+        self._cb_motion = None
+        self._cb_finish = None
+
+    def _sync_dragger_from_object(self) -> None:
+        if self.obj is None or self.dragger is None:
+            return
+        dragger_placement = _object_global_placement(self.obj) * self.transform_origin
+        self._set_dragger_placement(dragger_placement)
+        self.anchor_placement = dragger_placement
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
+
+    def _set_dragger_placement(self, placement: App.Placement) -> None:
+        base = placement.Base
+        self.dragger.translation.setValue(coin.SbVec3f(base.x, base.y, base.z))
+        self.dragger.rotation.setValue(_sb_rotation_from_placement(placement.Rotation))
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
+
+    def _get_dragger_placement(self) -> App.Placement:
+        d = self.dragger
+
+        if not hasattr(d, "translationIncrementCountX"):
+            trans = d.translation.getValue().getValue()
+            rot = _placement_from_sb_rotation(d.rotation.getValue())
+            return App.Placement(App.Vector(*trans), rot)
+
+        base_pos = App.Vector(*d.translation.getValue().getValue())
+        base_rot = _placement_from_sb_rotation(d.rotation.getValue())
+
+        t_step = d.translationIncrement.getValue()
+        x_steps = d.translationIncrementCountX.getValue()
+        y_steps = d.translationIncrementCountY.getValue()
+        z_steps = d.translationIncrementCountZ.getValue()
+
+        x_axis = base_rot.multVec(App.Vector(1, 0, 0))
+        y_axis = base_rot.multVec(App.Vector(0, 1, 0))
+        z_axis = base_rot.multVec(App.Vector(0, 0, 1))
+        delta = (
+            x_axis * (t_step * x_steps)
+            + y_axis * (t_step * y_steps)
+            + z_axis * (t_step * z_steps)
+        )
+
+        r_step = d.rotationIncrement.getValue()
+        rx = d.rotationIncrementCountX.getValue()
+        ry = d.rotationIncrementCountY.getValue()
+        rz = d.rotationIncrementCountZ.getValue()
+
+        new_rot = base_rot
+        new_rot = new_rot * App.Rotation(App.Vector(1, 0, 0), rx * r_step)
+        new_rot = new_rot * App.Rotation(App.Vector(0, 1, 0), ry * r_step)
+        new_rot = new_rot * App.Rotation(App.Vector(0, 0, 1), rz * r_step)
+
+        return App.Placement(base_pos + delta, new_rot)
+
+    def _apply_dragger_to_object(self) -> None:
+        if self.obj is None:
+            return
+        new_dragger_placement = self._get_dragger_placement()
+        new_global = new_dragger_placement * self.transform_origin.inverse()
+        _set_object_global_placement(self.obj, new_global)
+
+    def _open_transaction(self) -> None:
+        if self._transaction_open or self.doc is None:
+            return
+        self.doc.openTransaction("Interactive Gizmo")
+        self._transaction_open = True
+
+    def _commit_transaction(self) -> None:
+        if not self._transaction_open or self.doc is None:
+            return
+        self.doc.commitTransaction()
+        self._transaction_open = False
+
+    def _abort_transaction(self) -> None:
+        if not self._transaction_open or self.doc is None:
+            return
+        self.doc.abortTransaction()
+        self._transaction_open = False
+
+    def _on_drag_start(self, _dragger) -> None:
+        self._dragging = True
+        self._open_transaction()
+        self.anchor_placement = self._get_dragger_placement()
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
+
+    def _on_drag_motion(self, _dragger) -> None:
+        if not self._dragging:
+            return
+        self._apply_dragger_to_object()
+
+    def _on_drag_finish(self, _dragger) -> None:
+        if not self._dragging:
+            return
+        self._dragging = False
+        self._apply_dragger_to_object()
+        self.anchor_placement = self._get_dragger_placement()
+        if hasattr(self.dragger, "clearIncrementCounts"):
+            self.dragger.clearIncrementCounts()
+        self._commit_transaction()
+
+
+class _CommandToggle:
+    """Show / hide the interactive gizmo on the current selection."""
+
+    def GetResources(self) -> dict:
+        return {
+            "Pixmap": "Std_TransformManip",
+            "MenuText": "Interactive Gizmo",
+            "ToolTip": "Show Shapr3D-like translate and rotate handles on the selected object",
+        }
+
+    def Activated(self) -> None:
+        GizmoManager.instance().toggle()
+
+    def IsActive(self) -> bool:
+        return _selected_transformable() is not None or GizmoManager.instance().is_active
+
+
+class _CommandSettings:
+    """Adjust on-screen gizmo display ratio (v1.2)."""
+
+    def GetResources(self) -> dict:
+        return {
+            "Pixmap": "Std_TransformManip",
+            "MenuText": "Interactive Gizmo Settings",
+            "ToolTip": "Set gizmo display ratio (screen-constant size like Shapr3D)",
+        }
+
+    def Activated(self) -> None:
+        try:
+            from PySide import QtGui
+        except ImportError:
+            try:
+                from PySide2 import QtWidgets as QtGui
+            except ImportError:
+                from PySide6 import QtWidgets as QtGui
+
+        dialog = QtGui.QDialog()
+        dialog.setWindowTitle("Interactive Gizmo Settings")
+        layout = QtGui.QFormLayout(dialog)
+
+        ratio_spin = QtGui.QDoubleSpinBox()
+        ratio_spin.setRange(0.02, 1.0)
+        ratio_spin.setSingleStep(0.02)
+        ratio_spin.setDecimals(2)
+        ratio_spin.setValue(get_display_ratio())
+        ratio_spin.setToolTip(
+            "Screen-constant size factor. Larger = bigger handles. "
+            "Try 0.10 (default), 0.15, or 0.20 if too small."
+        )
+        layout.addRow("Display ratio:", ratio_spin)
+
+        mode_combo = QtGui.QComboBox()
+        mode_combo.addItem("Screen constant (Shapr3D-like)", SCALE_MODE_SCREEN)
+        mode_combo.addItem("World absolute (scales with model)", SCALE_MODE_WORLD)
+        mode_combo.setCurrentIndex(0 if get_scale_mode() == SCALE_MODE_SCREEN else 1)
+        layout.addRow("Size mode:", mode_combo)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec_() != QtGui.QDialog.Accepted:
+            return
+
+        set_display_ratio(ratio_spin.value())
+        set_scale_mode(mode_combo.currentData())
+        App.Console.PrintMessage(
+            f"Interactive Gizmo: display ratio={ratio_spin.value():.2f}, "
+            f"mode={'screen' if mode_combo.currentData() == SCALE_MODE_SCREEN else 'world'}.\n"
+        )
+
+        mgr = GizmoManager.instance()
+        if mgr.is_active and mgr.obj is not None and mgr.view is not None:
+            _apply_dragger_scale(mgr.dragger, mgr.view, mgr.obj)
+
+    def IsActive(self) -> bool:
+        return App.GuiUp
+
+
+class _CommandAutoToggle:
+    """Enable / disable attach-on-select behavior (v1.1)."""
+
+    def GetResources(self) -> dict:
+        return {
+            "Pixmap": "Std_TransformManip",
+            "MenuText": "Interactive Gizmo Auto",
+            "ToolTip": "Toggle automatic gizmo on single selection (Shapr3D-like)",
+        }
+
+    def Activated(self) -> None:
+        GizmoManager.instance().toggle_auto_mode()
+
+    def IsActive(self) -> bool:
+        return App.GuiUp
+
+
+class _CommandDetach:
+    """Remove the interactive gizmo overlay."""
+
+    def GetResources(self) -> dict:
+        return {
+            "Pixmap": "Std_TransformManip",
+            "MenuText": "Remove Interactive Gizmo",
+            "ToolTip": "Remove the interactive gizmo overlay",
+        }
+
+    def Activated(self) -> None:
+        GizmoManager.instance().detach()
+
+    def IsActive(self) -> bool:
+        return GizmoManager.instance().is_active
+
+
+def _register_commands() -> None:
+    if COMMAND_TOGGLE not in Gui.listCommands():
+        Gui.addCommand(COMMAND_TOGGLE, _CommandToggle())
+    if COMMAND_AUTO not in Gui.listCommands():
+        Gui.addCommand(COMMAND_AUTO, _CommandAutoToggle())
+    if COMMAND_SETTINGS not in Gui.listCommands():
+        Gui.addCommand(COMMAND_SETTINGS, _CommandSettings())
+    if COMMAND_DETACH not in Gui.listCommands():
+        Gui.addCommand(COMMAND_DETACH, _CommandDetach())
+
+
+_register_commands()
+
+# Executing this file (Macro → Execute) registers commands and toggles the gizmo.
+GizmoManager.instance().toggle()
