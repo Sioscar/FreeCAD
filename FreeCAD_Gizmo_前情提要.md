@@ -169,16 +169,20 @@ manip.addValueChangedCallback(on_motion)   # 具体回调注册方式按 pivy �
 | `src/Gui/Inventor/Draggers/SoTransformDragger.*` | FreeCAD 内置手柄（宏通过 `SoType.fromName` 实例化） |
 | `src/Gui/ViewProviderDragger.*` | 内置 `Std_TransformManip` 参考实现 |
 
-### 当前版本：v1.1.0
+### 当前版本：v1.2.0
 
 | 功能 | 状态 |
 |------|------|
 | 命令触发手柄 `InteractiveGizmo_Toggle` | ✅ |
 | 选中自动显示 `InteractiveGizmo_AutoToggle` | ✅ v1.1 |
+| **显示比例设置** `InteractiveGizmo_Settings` | ✅ v1.2 |
 | 平移 + 旋转写回 `Placement` | ✅ |
 | Undo（每次拖拽一步） | ✅ |
 | 旋转中心 = 包围盒中心 | ✅ |
+| 实时数值 HUD + 手动输入 | 📋 v1.3（见开发计划） |
 | Part Design：选 Pad 自动改用 Body | ✅ |
+
+**详细路线图**：见 `FreeCAD_Gizmo_开发计划.md`（Shapr3D 全面对标，吸附除外）。
 
 ### FreeCAD 1.1.1 踩坑（已修，勿回退）
 

@@ -24,7 +24,12 @@ except ImportError as exc:
 COMMAND_TOGGLE = "InteractiveGizmo_Toggle"
 COMMAND_DETACH = "InteractiveGizmo_Detach"
 COMMAND_AUTO = "InteractiveGizmo_AutoToggle"
-MACRO_VERSION = "1.1.0"
+COMMAND_SETTINGS = "InteractiveGizmo_Settings"
+MACRO_VERSION = "1.2.0"
+PREF_GROUP = "User parameter:BaseApp/Preferences/Mod/InteractiveGizmo"
+SCALE_MODE_SCREEN = 0
+SCALE_MODE_WORLD = 1
+DEFAULT_DISPLAY_RATIO = 0.10
 
 
 def _coin_node(type_name: str, fallback_type_name: str | None = None):
@@ -34,6 +39,67 @@ def _coin_node(type_name: str, fallback_type_name: str | None = None):
     if fallback_type_name:
         return getattr(coin, fallback_type_name)()
     raise RuntimeError(f"Coin node '{type_name}' is not available")
+
+
+def _prefs() -> App.ParameterGroup:
+    return App.ParamGet(PREF_GROUP)
+
+
+def get_display_ratio() -> float:
+    return _prefs().GetFloat("DisplayRatio", DEFAULT_DISPLAY_RATIO)
+
+
+def set_display_ratio(value: float) -> None:
+    _prefs().SetFloat("DisplayRatio", max(0.01, min(value, 1.0)))
+
+
+def get_scale_mode() -> int:
+    return int(_prefs().GetInt("ScaleMode", SCALE_MODE_SCREEN))
+
+
+def set_scale_mode(mode: int) -> None:
+    _prefs().SetInt("ScaleMode", int(mode))
+
+
+def get_camera_node(view):
+    """Prefer viewer camera; fall back to deprecated ActiveView.getCameraNode()."""
+    try:
+        viewer = view.getViewer()
+        if viewer is not None:
+            render_manager = viewer.getSoRenderManager()
+            if render_manager is not None:
+                camera = render_manager.getCamera()
+                if camera is not None:
+                    return camera
+    except Exception:
+        pass
+
+    try:
+        return view.getCameraNode()
+    except Exception:
+        return None
+
+
+def _bbox_diagonal(obj: App.DocumentObject) -> float:
+    shape = getattr(obj, "Shape", None)
+    if shape is not None and not shape.isNull():
+        bb = shape.BoundBox
+        return bb.DiagonalLength
+    return 10.0
+
+
+def _apply_dragger_scale(dragger, view, obj: App.DocumentObject) -> None:
+    ratio = get_display_ratio()
+    if get_scale_mode() == SCALE_MODE_SCREEN:
+        if hasattr(dragger, "draggerSize"):
+            dragger.draggerSize.setValue(ratio)
+        camera = get_camera_node(view)
+        if camera is not None and hasattr(dragger, "setUpAutoScale"):
+            dragger.setUpAutoScale(camera)
+    else:
+        world_size = max(_bbox_diagonal(obj) * ratio, 1.0)
+        if hasattr(dragger, "draggerSize"):
+            dragger.draggerSize.setValue(world_size)
 
 
 def _create_transform_dragger():
@@ -317,12 +383,7 @@ class GizmoManager:
 
         try:
             dragger.ref()
-            if hasattr(dragger, "draggerSize"):
-                dragger.draggerSize.setValue(0.12)
-
-            camera = view.getCameraNode()
-            if camera is not None and hasattr(dragger, "setUpAutoScale"):
-                dragger.setUpAutoScale(camera)
+            _apply_dragger_scale(dragger, view, obj)
 
             self.obj = obj
             self.doc = obj.Document
@@ -540,6 +601,71 @@ class _CommandToggle:
         return _selected_transformable() is not None or GizmoManager.instance().is_active
 
 
+class _CommandSettings:
+    """Adjust on-screen gizmo display ratio (v1.2)."""
+
+    def GetResources(self) -> dict:
+        return {
+            "Pixmap": "Std_TransformManip",
+            "MenuText": "Interactive Gizmo Settings",
+            "ToolTip": "Set gizmo display ratio (screen-constant size like Shapr3D)",
+        }
+
+    def Activated(self) -> None:
+        try:
+            from PySide import QtGui
+        except ImportError:
+            try:
+                from PySide2 import QtWidgets as QtGui
+            except ImportError:
+                from PySide6 import QtWidgets as QtGui
+
+        dialog = QtGui.QDialog()
+        dialog.setWindowTitle("Interactive Gizmo Settings")
+        layout = QtGui.QFormLayout(dialog)
+
+        ratio_spin = QtGui.QDoubleSpinBox()
+        ratio_spin.setRange(0.02, 1.0)
+        ratio_spin.setSingleStep(0.02)
+        ratio_spin.setDecimals(2)
+        ratio_spin.setValue(get_display_ratio())
+        ratio_spin.setToolTip(
+            "Screen-constant size factor. Larger = bigger handles. "
+            "Try 0.10 (default), 0.15, or 0.20 if too small."
+        )
+        layout.addRow("Display ratio:", ratio_spin)
+
+        mode_combo = QtGui.QComboBox()
+        mode_combo.addItem("Screen constant (Shapr3D-like)", SCALE_MODE_SCREEN)
+        mode_combo.addItem("World absolute (scales with model)", SCALE_MODE_WORLD)
+        mode_combo.setCurrentIndex(0 if get_scale_mode() == SCALE_MODE_SCREEN else 1)
+        layout.addRow("Size mode:", mode_combo)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec_() != QtGui.QDialog.Accepted:
+            return
+
+        set_display_ratio(ratio_spin.value())
+        set_scale_mode(mode_combo.currentData())
+        App.Console.PrintMessage(
+            f"Interactive Gizmo: display ratio={ratio_spin.value():.2f}, "
+            f"mode={'screen' if mode_combo.currentData() == SCALE_MODE_SCREEN else 'world'}.\n"
+        )
+
+        mgr = GizmoManager.instance()
+        if mgr.is_active and mgr.obj is not None and mgr.view is not None:
+            _apply_dragger_scale(mgr.dragger, mgr.view, mgr.obj)
+
+    def IsActive(self) -> bool:
+        return App.GuiUp
+
+
 class _CommandAutoToggle:
     """Enable / disable attach-on-select behavior (v1.1)."""
 
@@ -579,6 +705,8 @@ def _register_commands() -> None:
         Gui.addCommand(COMMAND_TOGGLE, _CommandToggle())
     if COMMAND_AUTO not in Gui.listCommands():
         Gui.addCommand(COMMAND_AUTO, _CommandAutoToggle())
+    if COMMAND_SETTINGS not in Gui.listCommands():
+        Gui.addCommand(COMMAND_SETTINGS, _CommandSettings())
     if COMMAND_DETACH not in Gui.listCommands():
         Gui.addCommand(COMMAND_DETACH, _CommandDetach())
 
